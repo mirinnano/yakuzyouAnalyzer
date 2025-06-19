@@ -1,0 +1,17 @@
+
+    Screen {
+        background: #1e1f22;
+        color: #f0f0f0;
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 1fr;
+        grid-gutter: 1;
+        padding: 1;
+    }
+    #trade-log, #trade-analysis {
+        border: round #4a4a4a;
+        background: #2f3136;
+        padding: 1;
+        overflow: auto;
+        height: 100%;
+    }
