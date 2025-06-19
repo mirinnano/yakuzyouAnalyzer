@@ -133,23 +133,40 @@ class TradeAnalysisWidget(Static):
             breakdown_table.add_row(lot_name, range_str, f"{b:,}", f"{s:,}", f"[{ns}]{n:+,}[/{ns}]")
         layout["breakdown"].update(Panel(breakdown_table, border_style="yellow")); self.update(layout)
 
-# --- メインアプリ (変更なし) ---
+# --- ★★★ここからが修正ブロック★★★ ---
+# --- メインアプリ ---
 class TraderApp(App):
     BINDINGS = [Binding("q", "quit", "終了"), Binding("p", "toggle_pause", "一時停止/再開"),]
-    def __init__(self, ticker_code: str):
-        super().__init__(); self.target_ticker = ticker_code; self.analyzer = TradeAnalyzer(); self.last_id = 0; self.df_history = pd.DataFrame(); self.is_paused = False; self.update_timer = None
-        self.footer_message_timer = None; self.trade_counts = deque(maxlen=30)
+    
+    # __init__を修正: プロセス情報を引き継ぐ
+    def __init__(self, ticker_code: str, background_process=None, excel_instance=None):
+        super().__init__()
+        self.target_ticker = ticker_code
+        self.analyzer = TradeAnalyzer()
+        self.last_id = 0
+        self.df_history = pd.DataFrame()
+        self.is_paused = False
+        self.update_timer = None
+        self.footer_message_timer = None
+        self.trade_counts = deque(maxlen=30)
+        # プロセス情報をインスタンス変数に保存
+        self.background_process = background_process
+        self.excel_instance = excel_instance
+
     CSS = ("Screen{layout:grid;grid-size:2;grid-columns:1fr 2fr;grid-gutter:1;padding:1;background:#1e1f22;} #trade-log,#trade-analysis{border:round #4a4a4a;background:#2f3136;padding:1;overflow:auto;height:100%;} #trade-analysis{padding:0;}")
+    
     def compose(self) -> ComposeResult: yield Header(show_clock=True); yield TradeLogWidget(id="trade-log"); yield TradeAnalysisWidget(id="trade-analysis"); yield Footer()
     def on_mount(self) -> None: self.update_panels(); self.update_timer = self.set_interval(2, self.update_panels)
     async def on_ready(self) -> None:
         try: self.query_one("#header-title", Static).update(f"統合トレーディング環境 - [{self.target_ticker}]")
         except Exception: pass
+    
     def show_flash_message(self, message: str, duration: float = 5.0):
         footer = self.query_one(Footer); footer.show_bindings = False; self.sub_title = message
         if self.footer_message_timer is not None: self.footer_message_timer.stop()
         self.footer_message_timer = self.set_timer(duration, self.clear_flash_message)
     def clear_flash_message(self): self.sub_title = ""; self.query_one(Footer).show_bindings = True; self.footer_message_timer = None
+
     def analyze_latest_ticks(self, new_df: pd.DataFrame, last_summary: dict | None):
         if new_df.empty or last_summary is None: return
         self.trade_counts.append(len(new_df))
@@ -158,6 +175,7 @@ class TraderApp(App):
             buy_ratio = (new_df['方向'] == '買い').sum() / len(new_df)
             if buy_ratio > 0.8: self.show_flash_message(f"[bold green]!![/] [white]高密度な[red]買いバースト[/red]を検知 ({len(new_df)}件)[/white]")
             elif buy_ratio < 0.2: self.show_flash_message(f"[bold red]!![/] [white]高密度な[yellowgreen]売りバースト[/yellowgreen]を検知 ({len(new_df)}件)[/white]")
+    
     def update_panels(self) -> None:
         if self.is_paused: return
         if not os.path.exists(DB_PATH): return
@@ -167,7 +185,9 @@ class TraderApp(App):
                 query = "SELECT id, jikoku AS 時刻, price AS 価格, dekidaka AS 出来高, baibai AS 方向 FROM ayumi WHERE ticker_code = ? AND id > ? ORDER BY id"
                 new_df = pd.read_sql_query(query, conn, params=(self.target_ticker, self.last_id))
         except sqlite3.Error as e: self.log(f"!!! データベースエラー: {e}"); return
+        
         self.analyze_latest_ticks(new_df, last_summary)
+        
         log_widget = self.query_one(TradeLogWidget); analysis_widget = self.query_one(TradeAnalysisWidget)
         log_widget.border_title = f"リアルタイム約定ログ [{self.target_ticker}]"; analysis_widget.border_title = f"インテリジェント約定分析 [{self.target_ticker}]"
         if new_df.empty and self.df_history.empty: analysis_widget.update_analysis(None); return
@@ -180,96 +200,110 @@ class TraderApp(App):
                 if summary['confidence'] >= 7 and "強い" in summary['signal']:
                     self.app.bell(); original_style = analysis_widget.styles.border; alert_color = "green" if "買い" in summary['signal'] else "red"
                     analysis_widget.styles.border = (alert_color, alert_color); self.set_timer(1.0, lambda: self.reset_border_style(analysis_widget, original_style))
+    
     def reset_border_style(self, widget: Static, original_style) -> None: widget.styles.border = original_style
-    def action_quit(self) -> None: self.exit()
+    
     def action_toggle_pause(self) -> None:
         self.is_paused = not self.is_paused
         if self.is_paused: self.show_flash_message("[yellow]一時停止中... (Pキーで再開)", duration=9999); self.update_timer.pause()
         else: self.clear_flash_message(); self.update_timer.resume()
 
-# --- ★★★ここからが修正ブロック★★★ ---
+    def action_quit(self) -> None:
+        """Qキーが押された時に呼ばれ、バックグラウンドプロセスを終了してからアプリを終了する。"""
+        print("\n>>> アプリケーションを終了しています...")
+        
+        # バックグラウンドのデータ収集スクリプトを終了
+        if self.background_process:
+            try:
+                print(">>> データ収集スクリプト(pythonw.exe)を終了します...")
+                self.background_process.terminate()
+                self.background_process.wait(timeout=3) # 終了を最大3秒待つ
+                print(">>> スクリプトを終了しました。")
+            except subprocess.TimeoutExpired:
+                print("XXX スクリプトの終了待機がタイムアウトしました。強制終了します。")
+                self.background_process.kill()
+            except Exception as e:
+                print(f"XXX スクリプトの終了中にエラーが発生しました: {e}")
+
+        # Excelアプリケーションを終了
+        if self.excel_instance:
+            try:
+                print(">>> Excelを終了します...")
+                # ワークブックを保存せずに閉じる（変更はTUI起動時に保存済みのため）
+                self.excel_instance.Workbooks(os.path.basename(EXCEL_WORKBOOK_PATH)).Close(SaveChanges=False)
+                # 他に開いているワークブックがなければExcel本体を終了
+                if self.excel_instance.Workbooks.Count == 0:
+                    self.excel_instance.Quit()
+                print(">>> Excelの関連処理を完了しました。")
+            except Exception as e:
+                print(f"XXX Excelの終了中にエラーが発生しました: {e}")
+
+        # TUIアプリを終了
+        self.exit("ユーザー操作により終了しました。")
+
 # --- 環境起動 司令塔 ---
 def launch_environment(ticker_code_to_set: str):
     """
     Excelを起動し、指定された銘柄コードをセルに書き込んでから、
-    データ収集スクリプトを起動する。
+    データ収集スクリプトを起動し、それらのプロセス情報を返す。
     """
     print(f">>> ステップ1: Excelを起動し、銘柄コードを {ticker_code_to_set} に更新します...")
+    excel_app = None
+    background_proc = None
     try:
-        excel = win32com.client.Dispatch("Excel.Application")
-        excel.Visible = True
-        
-        # --- アドインの堅牢な処理ロジック ---
-        target_addin_name = os.path.basename(EXCEL_ADDIN_PATH)
-        target_addin = None
-        
-        # 1. 既に登録済みのアドインを探す
-        for addin in excel.AddIns:
+        excel_app = win32com.client.Dispatch("Excel.Application")
+        excel_app.Visible = True
+        target_addin_name = os.path.basename(EXCEL_ADDIN_PATH); target_addin = None
+        for addin in excel_app.AddIns:
             if os.path.basename(addin.FullName) == target_addin_name:
-                target_addin = addin
-                print(f">>> アドイン '{target_addin_name}' は既に登録されています。")
-                break
-        
-        # 2. 登録されていなければ、新規に登録する
+                target_addin = addin; break
         if target_addin is None:
-            print(f">>> アドイン '{target_addin_name}' が未登録です。新規登録を試みます...")
-            target_addin = excel.AddIns.Add(EXCEL_ADDIN_PATH, CopyFile=True)
-            print(">>> アドインの登録に成功しました。")
-
-        # 3. アドインが有効(Installed)でなければ、有効化する
-        if not target_addin.Installed:
-            print(">>> アドインを有効化します...")
-            target_addin.Installed = True
-            print(">>> アドインが有効になりました。")
-        else:
-            print(">>> アドインは既に有効です。")
-            
-        # --- ワークブックの処理 ---
+            target_addin = excel_app.AddIns.Add(EXCEL_ADDIN_PATH, CopyFile=True)
+        if not target_addin.Installed: target_addin.Installed = True
+        
         target_wb = None
-        for wb in excel.Workbooks:
-            if wb.FullName == EXCEL_WORKBOOK_PATH:
-                target_wb = wb
-                break
-        if not target_wb:
-            target_wb = excel.Workbooks.Open(EXCEL_WORKBOOK_PATH)
-
-        # シートを選択し、指定セルに銘柄コードを書き込む
-        ws = target_wb.Sheets(EXCEL_SHEET_NAME_TICKER)
-        ws.Range(EXCEL_TICKER_CELL).Value = ticker_code_to_set
-        target_wb.Save()
+        for wb in excel_app.Workbooks:
+            if wb.FullName == EXCEL_WORKBOOK_PATH: target_wb = wb; break
+        if not target_wb: target_wb = excel_app.Workbooks.Open(EXCEL_WORKBOOK_PATH)
+        
+        ws = target_wb.Sheets(EXCEL_SHEET_NAME_TICKER); ws.Range(EXCEL_TICKER_CELL).Value = ticker_code_to_set; target_wb.Save()
         print(f">>> Excelシート '{EXCEL_SHEET_NAME_TICKER}' のセル {EXCEL_TICKER_CELL} を {ticker_code_to_set} に更新し、保存しました。")
-
     except Exception as e:
         print(f"XXX Excel操作中にエラーが発生しました: {e}")
-        print("XXX 続行しますが、データが正しく取得できない可能性があります。")
-        print("XXX Excelのパス、アドインのパスが正しいか、Excelが手動で開けるか確認してください。")
-    
-    # ステップ2: データ収集スクリプトの起動
+
     print(">>> ステップ2: データ収集スクリプトをバックグラウンドで起動します...")
     try:
-        subprocess.Popen(['pythonw', DATA_IMPORTER_SCRIPT_PATH])
+        background_proc = subprocess.Popen(['pythonw', DATA_IMPORTER_SCRIPT_PATH])
         print(">>> データ収集スクリプトを起動しました。")
     except Exception as e:
         print(f"XXX スクリプト起動失敗: {e}")
-# ★★★修正ブロックここまで★★★
+        
+    # ★修正点: Excelとsubprocessのオブジェクトを返す
+    return excel_app, background_proc
 
-# --- メイン実行ブロック (変更なし) ---
+# --- メイン実行ブロック ---
 if __name__ == "__main__":
     ticker_pattern = re.compile(r"^\d{4}(\.(JNX|CIX))?$", re.IGNORECASE)
     while True:
         ticker_code_input = input("監視したい銘柄コードを入力してください (例: 3350, 3350.JNX, 3350.CIX): ")
         cleaned_input = ticker_code_input.strip()
         if ticker_pattern.match(cleaned_input):
-            ticker_to_run = cleaned_input.upper()
-            break
-        else:
-            print("エラー: 「4桁の数字」または「4桁の数字.JNX/CIX」の形式で入力してください。")
-            
-    launch_environment(ticker_code_to_set=ticker_to_run)
+            ticker_to_run = cleaned_input.upper(); break
+        else: print("エラー: 「4桁の数字」または「4桁の数字.JNX/CIX」の形式で入力してください。")
+    
+    # ★修正点: 返り値を受け取る
+    excel_instance, bg_process = launch_environment(ticker_code_to_set=ticker_to_run)
     
     print(f">>> 監視対象銘柄: {ticker_to_run}")
     print(">>> 5秒後にTUI起動")
     sleep_timer.sleep(5)
     
-    app = TraderApp(ticker_code=ticker_to_run)
+    # ★修正点: プロセス情報をアプリに渡す
+    app = TraderApp(
+        ticker_code=ticker_to_run,
+        background_process=bg_process,
+        excel_instance=excel_instance
+    )
     app.run()
+    print(">>> TUIアプリケーションが終了しました。")
+
