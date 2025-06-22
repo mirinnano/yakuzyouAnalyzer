@@ -9,7 +9,9 @@ from collections import deque
 import sys
 import win32com.client
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Static, DataTable
+from textual.widgets import Header, Footer, Static, DataTable, Input, Button
+from textual.containers import VerticalScroll, Horizontal
+from textual.screen import ModalScreen
 from textual.binding import Binding
 from rich.text import Text
 from rich.table import Table
@@ -47,14 +49,12 @@ def resource_path(relative_path: str) -> str:
 EXCEL_WORKBOOK_PATH = os.path.join(AYUMI_BASE_DIR, "ayumi.xlsm")
 DB_PATH = os.path.join(AYUMI_BASE_DIR, "market_data.db")
 DATA_IMPORTER_SCRIPT_PATH = resource_path("ayumisql.py")
-# アドインのパスをユーザーのエラーログに基づき .xll 形式に修正
 EXCEL_ADDIN_PATH = os.path.expandvars(r"%LOCALAPPDATA%\MarketSpeed2\Bin\rss\MarketSpeed2_RSS_64bit.xll")
 
 # --- 定数 ---
 EXCEL_SHEET_NAME_TICKER = 'Sheet1'
 EXCEL_TICKER_CELL = 'E4'
-# アドインが正常に機能しているかを確認するためのセル。銘柄名などが表示されるセルを指定。
-VERIFICATION_CELL = 'F4' # 例: 銘柄名が表示されるセル
+VERIFICATION_CELL = 'F4'
 
 def format_yen(value: float) -> str:
     if value >= 1_0000_0000: return f"{value / 1_0000_0000:,.1f}億円"
@@ -120,6 +120,7 @@ class TradeLogWidget(Static):
     def on_mount(self) -> None:
         self.border_title = "リアルタイム約定ログ"; tbl = self.query_one(DataTable); tbl.cursor_type = "row"
         tbl.add_columns("時刻","価格","出来高","方向","ロット")
+
     def update_log(self, df: pd.DataFrame|None) -> None:
         tbl = self.query_one(DataTable); tbl.clear()
         if df is None or df.empty: return
@@ -139,6 +140,10 @@ class TradeLogWidget(Static):
         tbl.add_rows(rows)
         tbl.scroll_home(animate=False)
 
+    def clear_log(self) -> None:
+        """ログテーブルをクリアする"""
+        self.query_one(DataTable).clear()
+
 class TradeAnalysisWidget(Static):
     def on_mount(self) -> None:
         self.border_title = "インテリジェント約定分析"; self.analysis_layout = Layout(); self.analysis_layout.split_column(Layout(name="header", size=5), Layout(name="main"))
@@ -153,7 +158,9 @@ class TradeAnalysisWidget(Static):
         return grid
     def update_analysis(self, analysis: dict|None) -> None:
         layout = self.analysis_layout
-        if not analysis: self.update(Panel("分析データを待っています...", style="bold dim")); return
+        if not analysis:
+            self.update(Panel("分析データを待っています...", style="bold dim"))
+            return
         summary, metrics = analysis, analysis['metrics']; sig, conf, cond = summary['signal'], summary['confidence'], summary['condition']
         style = 'bold green' if '買い' in sig else 'bold red' if '売り' in sig else 'bold white'
         header_table = Table.grid(expand=True); header_table.add_column(justify="left"); header_table.add_column(justify="right")
@@ -175,8 +182,44 @@ class TradeAnalysisWidget(Static):
         layout["breakdown"].update(Panel(breakdown_content, border_style="yellow", title="売買分析"))
         self.update(layout)
 
+    def clear_analysis(self) -> None:
+        """分析パネルを初期状態に戻す"""
+        self.update_analysis(None)
+
+class ChangeTickerScreen(ModalScreen):
+    """銘柄コードを変更するためのモーダル画面"""
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="change_ticker_dialog"):
+            yield Static("新しい銘柄コードを入力してください (例: 3350, 5721.JNX)", id="change_ticker_title")
+            yield Input(placeholder="4桁の数字 or 4桁.JNX/CIX", id="ticker_input")
+            with Horizontal(id="change_ticker_buttons"):
+                yield Button("変更", variant="primary", id="apply_change")
+                yield Button("キャンセル", id="cancel_change")
+
+    def on_mount(self) -> None:
+        """マウント時にインプットウィジェットにフォーカスする"""
+        self.query_one(Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply_change":
+            ticker_input = self.query_one("#ticker_input", Input)
+            new_ticker = ticker_input.value.strip().upper() # 大文字に統一
+            # ★★ ここが修正箇所 1/2 ★★
+            if re.match(r"^\d{4}(\.(JNX|CIX))?$", new_ticker, re.IGNORECASE):
+                self.dismiss(new_ticker)
+            else:
+                ticker_input.border_title = "[bold red]無効な形式です[/]"
+                ticker_input.styles.border = ("round", "red")
+        else:
+            self.dismiss(None)
+
+
 class TraderApp(App):
-    BINDINGS = [Binding("q", "quit", "終了"), Binding("p", "toggle_pause", "一時停止/再開"),]
+    BINDINGS = [
+        Binding("q", "quit", "終了"),
+        Binding("p", "toggle_pause", "一時停止/再開"),
+        Binding("c", "change_ticker", "銘柄変更"),
+    ]
     def __init__(self, ticker_code: str, background_process=None, excel_instance=None):
         super().__init__()
         self.target_ticker = ticker_code
@@ -205,19 +248,30 @@ class TraderApp(App):
     async def on_ready(self) -> None:
         try:
             header = self.query_one(Header)
-            header.tall = True 
+            header.tall = True
             header.header_title = f"統合トレーディング環境\n銘柄: [{self.target_ticker}]"
         except Exception:
-            pass 
+            pass
+
     def update_status(self, message: str, color: str = "gray"):
-        if self.footer_message_timer is not None and self.footer_message_timer.is_running: return
+        """フッターの左側に通常メッセージを表示する。フラッシュメッセージ表示中は更新しない。"""
+        if self.footer_message_timer is not None:
+            return
         self.query_one(Footer).show_bindings = True; self.sub_title = f"[{color}]{message}[/{color}]"
+
     def show_flash_message(self, message: str, duration: float = 8.0):
+        """フッターの左側に一時的なメッセージ（フラッシュメッセージ）を表示する。"""
         self.sub_title = message
-        if self.footer_message_timer is not None: self.footer_message_timer.stop()
+        if self.footer_message_timer is not None:
+            self.footer_message_timer.stop()
         self.footer_message_timer = self.set_timer(duration, self.clear_flash_message)
+
     def clear_flash_message(self):
-        self.sub_title = ""; self.footer_message_timer = None; self.update_panels()
+        """フラッシュメッセージをクリアする。"""
+        self.sub_title = ""
+        self.footer_message_timer = None
+        self.update_panels()
+
     def analyze_latest_ticks(self, new_df: pd.DataFrame, last_summary: dict | None):
         if new_df.empty or last_summary is None: return
         self.trade_counts.append(len(new_df))
@@ -242,7 +296,9 @@ class TraderApp(App):
         self.analyze_latest_ticks(new_df, last_summary)
         log_widget = self.query_one(TradeLogWidget); analysis_widget = self.query_one(TradeAnalysisWidget)
         log_widget.border_title = f"リアルタイム約定ログ [{self.target_ticker}]"; analysis_widget.border_title = f"インテリジェント約定分析 [{self.target_ticker}]"
-        if new_df.empty and self.df_history.empty: analysis_widget.update_analysis(None); return
+        if new_df.empty and self.df_history.empty:
+            analysis_widget.update_analysis(None)
+            return
         elif not new_df.empty:
             self.df_history = pd.concat([self.df_history, new_df]).tail(10000)
             self.last_id = int(self.df_history['id'].max())
@@ -259,6 +315,60 @@ class TraderApp(App):
         self.is_paused = not self.is_paused
         if self.is_paused: self.show_flash_message("[yellow]一時停止中...[/]", duration=9999); self.update_timer.pause(); self.update_status("一時停止中", color="yellow")
         else: self.clear_flash_message(); self.update_timer.resume(); self.update_panels()
+
+    def action_change_ticker(self) -> None:
+        """銘柄変更モーダルを表示する"""
+        def handle_new_ticker(new_ticker: str | None):
+            if new_ticker:
+                # バックグラウンドで変更処理を実行
+                self.run_worker(self.process_ticker_change(new_ticker), exclusive=True)
+        self.push_screen(ChangeTickerScreen(), handle_new_ticker)
+
+    async def process_ticker_change(self, new_ticker: str):
+        """銘柄変更の全プロセスを管理する"""
+        # 1. 現在の処理を一時停止
+        self.show_flash_message(f"[yellow]銘柄を {new_ticker} に変更中...[/]", duration=9999)
+        if self.update_timer: self.update_timer.pause()
+
+        # 2. 既存のプロセスと接続をクリーンアップ
+        self.log(f">>> 銘柄変更開始: {self.target_ticker} -> {new_ticker}")
+        if self.background_process:
+            self.log(">>> 古いデータ収集スクリプトを終了します...")
+            self.background_process.terminate()
+            self.background_process.wait(timeout=3)
+        if self.db_connection:
+            self.log(">>> データベース接続を解放します...")
+            self.db_connection.close()
+            self.db_connection = None
+
+        # 3. TUIの状態をリセット
+        self.log(">>> UIの状態をリセットします...")
+        self.target_ticker = new_ticker
+        self.df_history = pd.DataFrame()
+        self.last_id = 0
+        self.query_one(TradeLogWidget).clear_log()
+        self.query_one(TradeAnalysisWidget).clear_analysis()
+        self.query_one(Header).header_title = f"統合トレーディング環境\n銘柄: [{self.target_ticker}]"
+
+        # 4. 新しい銘柄で環境を再起動
+        self.log(f">>> {new_ticker} で環境を再起動します...")
+        _, self.background_process = launch_environment(
+            ticker_code_to_set=new_ticker,
+            excel_instance=self.excel_instance
+        )
+
+        # 5. DBに再接続し、ポーリングを再開
+        sleep_timer.sleep(3) # 新しいプロセスがDBを準備するのを少し待つ
+        try:
+            self.db_connection = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10.0, check_same_thread=False)
+            self.db_connection.execute("PRAGMA journal_mode=WAL;")
+            self.log(">>> 新しいデータベース接続を確立しました。")
+            if self.update_timer: self.update_timer.resume()
+            self.clear_flash_message()
+            self.show_flash_message(f"[bold green]銘柄が {new_ticker} に変更されました。[/]", duration=5)
+        except sqlite3.Error as e:
+            self.show_flash_message(f"[bold red]!!! DB再接続エラー: {e}[/]", duration=9999)
+
     def action_quit(self) -> None:
         self.log("\n>>> アプリケーションを終了しています...")
         if self.background_process:
@@ -278,32 +388,48 @@ class TraderApp(App):
                 self.log(f"XXX Excelの解放中にエラー: {e}")
         self.exit("ユーザー操作により終了しました。")
 
-def launch_environment(ticker_code_to_set: str):
+
+def launch_environment(ticker_code_to_set: str, excel_instance=None):
     """
-    Excelを起動し、指定された銘柄コードをセルに書き込んでから、
+    Excelを起動または再利用し、指定された銘柄コードをセルに書き込んでから、
     データ収集スクリプトを起動し、それらのプロセス情報を返す。
     """
-    print(f">>> ステップ1: Excelを起動し、銘柄コードを {ticker_code_to_set} に更新します...")
-    excel_app = None
+    print(f">>> ステップ1: Excelを操作し、銘柄コードを {ticker_code_to_set} に更新します...")
+    excel_app = excel_instance
     background_proc = None
     try:
-        excel_app = win32com.client.Dispatch("Excel.Application")
-        excel_app.Visible = True
-        target_addin_name = os.path.basename(EXCEL_ADDIN_PATH); target_addin = None
+        if excel_app is None:
+            excel_app = win32com.client.Dispatch("Excel.Application")
+            excel_app.Visible = True
+
+        target_addin_name = os.path.basename(EXCEL_ADDIN_PATH)
+        target_addin = None
         for addin in excel_app.AddIns:
             if os.path.basename(addin.FullName) == target_addin_name:
-                target_addin = addin; break
+                target_addin = addin
+                break
         if target_addin is None:
             target_addin = excel_app.AddIns.Add(EXCEL_ADDIN_PATH, CopyFile=True)
-        if not target_addin.Installed: target_addin.Installed = True
+
+        if not target_addin.Installed:
+            target_addin.Installed = True
         
         target_wb = None
         for wb in excel_app.Workbooks:
-            if wb.FullName == EXCEL_WORKBOOK_PATH: target_wb = wb; break
-        if not target_wb: target_wb = excel_app.Workbooks.Open(EXCEL_WORKBOOK_PATH)
+            try:
+                if wb.FullName == EXCEL_WORKBOOK_PATH:
+                    target_wb = wb
+                    break
+            except Exception:
+                continue
+
+        if not target_wb:
+            target_wb = excel_app.Workbooks.Open(EXCEL_WORKBOOK_PATH)
         
-        ws = target_wb.Sheets(EXCEL_SHEET_NAME_TICKER); ws.Range(EXCEL_TICKER_CELL).Value = ticker_code_to_set; target_wb.Save()
-        print(f">>> Excelシート '{EXCEL_SHEET_NAME_TICKER}' のセル {EXCEL_TICKER_CELL} を {ticker_code_to_set} に更新し、保存しました。")
+        ws = target_wb.Sheets(EXCEL_SHEET_NAME_TICKER)
+        ws.Range(EXCEL_TICKER_CELL).Value = ticker_code_to_set
+        # target_wb.Save() # 頻繁な変更で問題を起こす可能性があるためコメントアウト
+        print(f">>> Excelシート '{EXCEL_SHEET_NAME_TICKER}' のセル {EXCEL_TICKER_CELL} を {ticker_code_to_set} に更新しました。")
     except Exception as e:
         print(f"XXX Excel操作中にエラーが発生しました: {e}")
 
@@ -314,27 +440,27 @@ def launch_environment(ticker_code_to_set: str):
     except Exception as e:
         print(f"XXX スクリプト起動失敗: {e}")
         
-    # ★修正点: Excelとsubprocessのオブジェクトを返す
     return excel_app, background_proc
 
 # --- メイン実行ブロック ---
 if __name__ == "__main__":
+    # ★★ ここが修正箇所 2/2 ★★
     ticker_pattern = re.compile(r"^\d{4}(\.(JNX|CIX))?$", re.IGNORECASE)
     while True:
-        ticker_code_input = input("監視したい銘柄コードを入力してください (例: 3350, 3350.JNX, 3350.CIX): ")
-        cleaned_input = ticker_code_input.strip()
+        ticker_code_input = input("監視したい銘柄コードを入力してください (例: 3350, 5721.JNX): ")
+        cleaned_input = ticker_code_input.strip().upper() # 大文字に統一
         if ticker_pattern.match(cleaned_input):
-            ticker_to_run = cleaned_input.upper(); break
-        else: print("エラー: 「4桁の数字」または「4桁の数字.JNX/CIX」の形式で入力してください。")
+            ticker_to_run = cleaned_input
+            break
+        else:
+            print("エラー: 「4桁の数字」または「4桁の数字.JNX/CIX」の形式で入力してください。")
     
-    # ★修正点: 返り値を受け取る
     excel_instance, bg_process = launch_environment(ticker_code_to_set=ticker_to_run)
     
     print(f">>> 監視対象銘柄: {ticker_to_run}")
     print(">>> 5秒後にTUI起動")
     sleep_timer.sleep(5)
     
-    # ★修正点: プロセス情報をアプリに渡す
     app = TraderApp(
         ticker_code=ticker_to_run,
         background_process=bg_process,
